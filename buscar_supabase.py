@@ -123,6 +123,27 @@ def fetch_session_meta(c, session_ids: list[str]) -> dict[str, dict]:
     return {r["session_id"]: r for r in rows}
 
 
+def most_common_turn_cwd(c, session_id: str) -> str | None:
+    """Pick the most frequent cwd across a session's turns.
+
+    memory_sessions.cwd is unreliable (the refresh RPC sometimes stores a cwd
+    from a stray turn, e.g. when a helper script cd'd elsewhere mid-session).
+    The majority cwd among turns is a much better signal for where the user
+    actually was working, which is what claude --resume needs to find the JSONL."""
+    from collections import Counter
+    rows = select(
+        c,
+        "memory_turns",
+        session_id=f"eq.{session_id}",
+        select="cwd",
+        limit=10000,
+    )
+    cwds = [r["cwd"] for r in rows if r.get("cwd")]
+    if not cwds:
+        return None
+    return Counter(cwds).most_common(1)[0][0]
+
+
 def ensure_jsonl_local(c, session: dict) -> tuple[Path, bool]:
     """Make sure the JSONL for this session exists in ~/.claude/projects/<project>/.
     Returns (path, downloaded). Downloads from Storage if absent."""
@@ -139,8 +160,8 @@ def ensure_jsonl_local(c, session: dict) -> tuple[Path, bool]:
 
 
 def open_session(c, session: dict) -> None:
-    cwd = session.get("cwd") or str(Path.home())
     sid = session["session_id"]
+    cwd = most_common_turn_cwd(c, sid) or session.get("cwd") or str(Path.home())
     cwd_path = Path(cwd)
     ensure_jsonl_local(c, session)
     if not cwd_path.exists():
