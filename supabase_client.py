@@ -69,7 +69,12 @@ def rpc(c: httpx.Client, fn: str, args: dict[str, Any]) -> Any:
     r = c.post(f"/rest/v1/rpc/{fn}", json=args)
     if r.status_code >= 400:
         raise RuntimeError(f"RPC {fn} failed: {r.status_code} {r.text[:400]}")
-    return r.json()
+    if r.status_code == 204 or not r.content:
+        return None
+    try:
+        return r.json()
+    except ValueError:
+        return None
 
 
 def select(c: httpx.Client, table: str, **params: Any) -> list[dict[str, Any]]:
