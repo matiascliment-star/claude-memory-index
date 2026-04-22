@@ -123,13 +123,23 @@ def fetch_session_meta(c, session_ids: list[str]) -> dict[str, dict]:
     return {r["session_id"]: r for r in rows}
 
 
-def most_common_turn_cwd(c, session_id: str) -> str | None:
-    """Pick the most frequent cwd across a session's turns.
+def projectify(cwd: str) -> str:
+    """Mirror Claude Code's cwd → project-dir transform: '/' becomes '-'."""
+    if not cwd.startswith("/"):
+        return cwd
+    return "-" + cwd[1:].replace("/", "-")
 
-    memory_sessions.cwd is unreliable (the refresh RPC sometimes stores a cwd
-    from a stray turn, e.g. when a helper script cd'd elsewhere mid-session).
-    The majority cwd among turns is a much better signal for where the user
-    actually was working, which is what claude --resume needs to find the JSONL."""
+
+def pick_session_cwd(c, session_id: str, project: str | None) -> str | None:
+    """Pick the cwd claude --resume needs: the one whose projectified form
+    matches the JSONL's project directory.
+
+    memory_sessions.cwd is unreliable (the refresh RPC sometimes stores a
+    stray turn's cwd). Plain mode of turn cwds is also unreliable: subagents
+    and tool wrappers can log cwds like .../tool-results/ in the majority of
+    turns. The project dir name uniquely identifies the cwd claude expects,
+    so we prefer cwds that projectify to it, and only fall back to the mode
+    if nothing matches."""
     from collections import Counter
     rows = select(
         c,
@@ -141,7 +151,12 @@ def most_common_turn_cwd(c, session_id: str) -> str | None:
     cwds = [r["cwd"] for r in rows if r.get("cwd")]
     if not cwds:
         return None
-    return Counter(cwds).most_common(1)[0][0]
+    counts = Counter(cwds)
+    if project:
+        matching = [(cwd, n) for cwd, n in counts.items() if projectify(cwd) == project]
+        if matching:
+            return max(matching, key=lambda x: x[1])[0]
+    return counts.most_common(1)[0][0]
 
 
 def ensure_jsonl_local(c, session: dict) -> tuple[Path, bool]:
@@ -161,7 +176,7 @@ def ensure_jsonl_local(c, session: dict) -> tuple[Path, bool]:
 
 def open_session(c, session: dict) -> None:
     sid = session["session_id"]
-    cwd = most_common_turn_cwd(c, sid) or session.get("cwd") or str(Path.home())
+    cwd = pick_session_cwd(c, sid, session.get("project")) or session.get("cwd") or str(Path.home())
     cwd_path = Path(cwd)
     ensure_jsonl_local(c, session)
     if not cwd_path.exists():
