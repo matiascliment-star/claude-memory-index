@@ -84,7 +84,13 @@ def select(c: httpx.Client, table: str, **params: Any) -> list[dict[str, Any]]:
     return r.json()
 
 
+STANDARD_UPLOAD_MAX = 50 * 1024 * 1024  # 50 MB; above this use resumable
+
+
 def storage_upload(c: httpx.Client, path: str, data: bytes) -> None:
+    """Upload to Storage. Auto-switches to resumable (TUS) for files >50 MB."""
+    if len(data) > STANDARD_UPLOAD_MAX:
+        return storage_upload_resumable(c, path, data)
     r = c.post(
         f"/storage/v1/object/{BUCKET}/{path}",
         content=data,
@@ -93,8 +99,58 @@ def storage_upload(c: httpx.Client, path: str, data: bytes) -> None:
             "x-upsert": "true",
         },
     )
+    if r.status_code == 413:
+        return storage_upload_resumable(c, path, data)
     if r.status_code >= 400:
         raise RuntimeError(f"storage upload failed: {r.status_code} {r.text[:400]}")
+
+
+def storage_upload_resumable(c: httpx.Client, path: str, data: bytes) -> None:
+    """Upload via Supabase's TUS-compatible resumable endpoint. For files >50 MB."""
+    import base64
+    meta_pairs = {
+        "bucketName": BUCKET,
+        "objectName": path,
+        "contentType": "application/octet-stream",
+        "cacheControl": "3600",
+    }
+    meta = ",".join(
+        f"{k} {base64.b64encode(v.encode()).decode()}" for k, v in meta_pairs.items()
+    )
+    r = c.post(
+        "/storage/v1/upload/resumable",
+        headers={
+            "Tus-Resumable": "1.0.0",
+            "Upload-Length": str(len(data)),
+            "Upload-Metadata": meta,
+            "x-upsert": "true",
+            "Content-Length": "0",
+        },
+    )
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"resumable init failed: {r.status_code} {r.text[:400]}")
+    upload_url = r.headers.get("location")
+    if not upload_url:
+        raise RuntimeError(f"resumable init missing Location header: {dict(r.headers)}")
+
+    CHUNK = 6 * 1024 * 1024  # 6 MB per PATCH
+    offset = 0
+    while offset < len(data):
+        chunk = data[offset : offset + CHUNK]
+        r = c.patch(
+            upload_url,
+            content=chunk,
+            headers={
+                "Tus-Resumable": "1.0.0",
+                "Upload-Offset": str(offset),
+                "Content-Type": "application/offset+octet-stream",
+            },
+        )
+        if r.status_code not in (200, 204):
+            raise RuntimeError(f"resumable patch failed at offset {offset}: {r.status_code} {r.text[:200]}")
+        offset = int(r.headers.get("upload-offset", offset + len(chunk)))
+    if offset != len(data):
+        raise RuntimeError(f"resumable upload ended at offset {offset} != {len(data)}")
 
 
 def storage_download(c: httpx.Client, path: str) -> bytes:
