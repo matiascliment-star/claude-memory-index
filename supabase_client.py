@@ -1,5 +1,6 @@
 """Thin Supabase REST/Storage client for the memory index."""
 from __future__ import annotations
+import gzip
 import os
 import socket
 from pathlib import Path
@@ -87,10 +88,17 @@ def select(c: httpx.Client, table: str, **params: Any) -> list[dict[str, Any]]:
 STANDARD_UPLOAD_MAX = 50 * 1024 * 1024  # 50 MB; above this use resumable
 
 
-def storage_upload(c: httpx.Client, path: str, data: bytes) -> None:
-    """Upload to Storage. Auto-switches to resumable (TUS) for files >50 MB."""
+def storage_upload(c: httpx.Client, path: str, data: bytes, *, compress: bool = True) -> str:
+    """Upload to Storage. Gzips by default (JSONL compresses 70-90%) and appends
+    .gz to the path. Auto-switches to resumable (TUS) for payloads >50 MB.
+
+    Returns the final storage path (with .gz suffix if compressed)."""
+    if compress and not path.endswith(".gz"):
+        data = gzip.compress(data, compresslevel=6)
+        path = path + ".gz"
     if len(data) > STANDARD_UPLOAD_MAX:
-        return storage_upload_resumable(c, path, data)
+        _upload_resumable(c, path, data)
+        return path
     r = c.post(
         f"/storage/v1/object/{BUCKET}/{path}",
         content=data,
@@ -100,12 +108,14 @@ def storage_upload(c: httpx.Client, path: str, data: bytes) -> None:
         },
     )
     if r.status_code == 413:
-        return storage_upload_resumable(c, path, data)
+        _upload_resumable(c, path, data)
+        return path
     if r.status_code >= 400:
         raise RuntimeError(f"storage upload failed: {r.status_code} {r.text[:400]}")
+    return path
 
 
-def storage_upload_resumable(c: httpx.Client, path: str, data: bytes) -> None:
+def _upload_resumable(c: httpx.Client, path: str, data: bytes) -> None:
     """Upload via Supabase's TUS-compatible resumable endpoint. For files >50 MB."""
     import base64
     meta_pairs = {
@@ -125,6 +135,7 @@ def storage_upload_resumable(c: httpx.Client, path: str, data: bytes) -> None:
             "Upload-Metadata": meta,
             "x-upsert": "true",
             "Content-Length": "0",
+            "Content-Type": "application/offset+octet-stream",
         },
     )
     if r.status_code not in (200, 201):
@@ -132,6 +143,9 @@ def storage_upload_resumable(c: httpx.Client, path: str, data: bytes) -> None:
     upload_url = r.headers.get("location")
     if not upload_url:
         raise RuntimeError(f"resumable init missing Location header: {dict(r.headers)}")
+    # The Location may be a full URL or relative — normalize to a usable target.
+    if upload_url.startswith("/"):
+        upload_url = f"{SUPABASE_URL}{upload_url}"
 
     CHUNK = 6 * 1024 * 1024  # 6 MB per PATCH
     offset = 0
@@ -154,9 +168,12 @@ def storage_upload_resumable(c: httpx.Client, path: str, data: bytes) -> None:
 
 
 def storage_download(c: httpx.Client, path: str) -> bytes:
+    """Download from Storage. Auto-decompresses .gz paths."""
     r = c.get(f"/storage/v1/object/{BUCKET}/{path}")
     if r.status_code >= 400:
         raise RuntimeError(f"storage download failed: {r.status_code} {r.text[:400]}")
+    if path.endswith(".gz"):
+        return gzip.decompress(r.content)
     return r.content
 
 

@@ -145,10 +145,10 @@ def process_file(c, model, path: Path, mid: str, force: bool, log) -> tuple[int,
         sid_from_name = path.stem
         storage_path = f"{mid}/{project}/{path.name}"
         try:
-            storage_upload(c, storage_path, path.read_bytes())
+            final_path = storage_upload(c, storage_path, path.read_bytes())
             rpc(c, "memory_set_jsonl_path", {
                 "sid": sid_from_name,
-                "path": storage_path,
+                "path": final_path,
                 "mtime": stat.st_mtime,
                 "size": stat.st_size,
             })

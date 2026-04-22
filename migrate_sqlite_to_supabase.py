@@ -111,10 +111,10 @@ def main():
             storage_path = f"{mid}/{project}/{p.name}"
             sid = p.stem
             try:
-                storage_upload(c, storage_path, p.read_bytes())
+                final_path = storage_upload(c, storage_path, p.read_bytes())
                 rpc(c, "memory_set_jsonl_path", {
                     "sid": sid,
-                    "path": storage_path,
+                    "path": final_path,
                     "mtime": p.stat().st_mtime,
                     "size": p.stat().st_size,
                 })
