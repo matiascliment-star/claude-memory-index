@@ -1,62 +1,70 @@
 ---
 name: buscar-conversacion
-description: Busca en el historial completo de conversaciones de Claude Code (todas las sesiones previas en ~/.claude/projects/). Usa búsqueda híbrida (full-text BM25 + embeddings semánticos multilingües) sobre una base SQLite local. Devuelve los turnos más relevantes con fecha, snippet, session-id y el comando claude --resume para reabrir esa conversación. Usar cuando el usuario pregunte "¿te acordás cuando hablamos de X?", "buscá aquella conversación sobre Y", "qué dijimos la otra vez de Z", "buscá en el historial", "dónde hablamos de", "en qué sesión", "recordás cuando", o cualquier consulta sobre charlas pasadas conmigo. Triggers literales: "te acordás", "acordate", "recordás", "busca en conversaciones", "busca historial", "qué conversación", "cuál fue la sesión", "buscar en memoria", "hablamos de".
+description: Busca en el historial completo de conversaciones de Claude Code (todas las sesiones previas, incluso las que nacieron en OTRA máquina). Backend Supabase con pgvector (semántico) + tsvector (full-text) + Storage bucket con los JSONL para poder reabrir sesiones cross-machine. Devuelve los turnos más relevantes con fecha, snippet, session-id y comando para reabrirlos. Usar cuando el usuario pregunte "¿te acordás cuando hablamos de X?", "buscá aquella conversación sobre Y", "qué dijimos la otra vez de Z", "buscá en el historial", "dónde hablamos de", "en qué sesión", "recordás cuando", o cualquier consulta sobre charlas pasadas conmigo. Triggers literales: "te acordás", "acordate", "recordás", "busca en conversaciones", "busca historial", "qué conversación", "cuál fue la sesión", "buscar en memoria", "hablamos de".
 ---
 
 # Skill: buscar-conversacion
 
-Busca en el historial completo de charlas con el usuario (todas las sesiones de Claude Code).
+Busca en el historial completo de charlas con el usuario, incluso entre máquinas.
 
-## Cómo funciona
+## Backend actual: Supabase (V2)
 
-La base SQLite vive en `~/.claude/memory-index/conversations.db`. Se indexa leyendo todos los JSONL de `~/.claude/projects/*/*.jsonl`. Cada turno (user + assistant) se guarda con:
+- Tablas: `memory_turns`, `memory_sessions`, `memory_files_indexed`
+- Storage bucket: `claude-memory-jsonl` (JSONLs de todas las sesiones)
+- Proyecto: `wdgdbbcwcrirpnfdmykh` (Estudio Jurídico)
+- Scripts: `~/.claude/memory-index/buscar_supabase.py`, `indexar_supabase.py`, `supabase_client.py`
+- Credenciales: `SUPABASE_URL` y `SUPABASE_KEY` en `~/.env` (service_role)
 
-- Texto completo en FTS5 (búsqueda literal con BM25 y stemming)
-- Embedding multilingüe de 384 dim (búsqueda semántica por concepto)
-
-`buscar.py` hace **búsqueda híbrida** fusionando ambos resultados con Reciprocal Rank Fusion.
+El indexador corre en el hook `SessionStart` — cada vez que abrís Claude Code,
+sincroniza turnos nuevos y sube los JSONL cambiados al bucket.
 
 ## Uso desde Claude Code
 
-Cuando el usuario pregunte por una conversación pasada, ejecutá:
+Cuando el usuario pregunte por una conversación pasada:
 
 ```bash
-~/.claude/memory-index/venv/bin/python ~/.claude/memory-index/buscar.py "<query del usuario>"
+~/.claude/memory-index/venv/bin/python ~/.claude/memory-index/buscar_supabase.py "<query>"
 ```
 
-Flags útiles:
+Flags:
 - `-n 10` → más resultados (default 5)
-- `--mode fts` → solo full-text (más rápido si hay una palabra única como un apellido)
+- `--mode fts` → solo full-text (más preciso si hay una palabra única: apellido, nombre de skill, nº expediente)
 - `--mode semantic` → solo semántico (si el usuario describe un concepto sin palabras exactas)
-- `--json` → para parsear la salida y reformatearla
-- `--per-session 3` → traer más de un turno por sesión (útil si vas a profundizar en una conversación específica)
+- `--json` → para parsear y reformatear
+- `--per-session 3` → más de un turno por sesión (para profundizar)
+- `--open N` → **reabre el resultado N** en una Terminal nueva (macOS); baja el JSONL de Storage si la sesión nació en otra máquina
+- `--include-current` → incluye sesiones activas. Por default, el script excluye cualquier sesión cuyo JSONL fue escrito en los últimos 3 min (evita que la charla actual se cuele como resultado, porque el indexador corre en `SessionStart`).
 
-## Cómo presentar los resultados al usuario
+## Cómo presentar los resultados
 
-1. Mostrale los top 3-5 con fecha, snippet y primer prompt de la sesión.
-2. Preguntá cuál quiere reabrir (por número).
-3. Para reabrir, corré `buscar.py` de nuevo con `--open N` (N = número del resultado). Esto abre `claude --resume <id>` en una Terminal.app nueva vía osascript. No uses el comando `claude --resume` dentro de Bash tool — spawnearía una sub-sesión dentro de la actual.
+1. Mostrá top 3-5 con fecha, snippet, primer prompt, máquina de origen (⬡).
+2. Preguntá cuál reabrir por número.
+3. Para abrir: volvé a correr `buscar_supabase.py "<misma query>" --open N`.
+   NO uses `claude --resume <id>` directamente desde Bash tool porque spawnearía
+   una sub-sesión dentro de la actual y porque el comando necesita `cd` al cwd
+   original (el script lo hace vía osascript).
 
 ## Si la query es ambigua
 
-- Empezá con `--mode hybrid` (default).
-- Si no hay hits obvios y el query parece conceptual, probá `--mode semantic` con términos reformulados.
-- Si el usuario mencionó una palabra muy específica (apellido, número de expediente, nombre de skill), probá `--mode fts` para ordenar por BM25 puro.
+- Empezá con `--mode hybrid` (default, fusión RRF).
+- Palabra específica (apellido, expediente, skill) → `--mode fts`.
+- Concepto vago → `--mode semantic` con términos reformulados.
 
-## Reindexación
-
-Para reindexar sesiones nuevas (incremental, rápido):
+## Reindexación manual
 
 ```bash
-~/.claude/memory-index/venv/bin/python ~/.claude/memory-index/indexar.py --quiet
+~/.claude/memory-index/venv/bin/python ~/.claude/memory-index/indexar_supabase.py --quiet
 ```
 
-Esto se corre solo en el scheduled trigger diario (`reindex-memory`), pero podés forzarlo manualmente si el usuario acaba de tener una conversación importante en otra ventana y quiere buscarla ya.
+Ya corre solo en `SessionStart`. Forzalo a mano si el usuario acaba de charlar
+mucho en otra ventana y quiere buscarlo ya.
 
-## Estructura de la base
+## Fallback V1 (SQLite local)
 
-```sql
-turns(id, turn_uuid, session_id, project, role, content, timestamp, cwd, git_branch, embedding)
-turns_fts (FTS5 virtual table sobre content)
-files_indexed(path, mtime, size, last_line, indexed_at)
+Si Supabase no está disponible o el usuario pidió modo offline:
+
+```bash
+~/.claude/memory-index/venv/bin/python ~/.claude/memory-index/buscar.py "<query>"
 ```
+
+Misma interfaz, base local `~/.claude/memory-index/conversations.db`.
